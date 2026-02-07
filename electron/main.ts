@@ -1,7 +1,6 @@
 import { app, BrowserWindow, nativeImage, dialog } from 'electron';
 import path from 'path';
 import { spawn, execFileSync, ChildProcess } from 'child_process';
-import fs from 'fs';
 import net from 'net';
 import os from 'os';
 
@@ -14,71 +13,11 @@ let userShellEnv: Record<string, string> = {};
 const isDev = !app.isPackaged;
 
 /**
- * Verify that better_sqlite3.node in standalone resources is compatible
- * with this Electron runtime's ABI. If it was built for a different
- * Node.js ABI (e.g. system Node v22 ABI 127 vs Electron's ABI 143),
- * show a clear error instead of a cryptic MODULE_NOT_FOUND crash.
- */
-function checkNativeModuleABI(): void {
-  if (isDev) return; // Skip in dev mode
-
-  const standaloneDir = path.join(process.resourcesPath, 'standalone');
-
-  // Find better_sqlite3.node recursively
-  function findNodeFile(dir: string): string | null {
-    if (!fs.existsSync(dir)) return null;
-    const entries = fs.readdirSync(dir, { withFileTypes: true });
-    for (const entry of entries) {
-      const fullPath = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        const found = findNodeFile(fullPath);
-        if (found) return found;
-      } else if (entry.name === 'better_sqlite3.node') {
-        return fullPath;
-      }
-    }
-    return null;
-  }
-
-  const nodeFile = findNodeFile(path.join(standaloneDir, 'node_modules'));
-  if (!nodeFile) {
-    console.warn('[ABI check] better_sqlite3.node not found in standalone resources');
-    return;
-  }
-
-  try {
-    // Attempt to load the native module to verify ABI compatibility
-    process.dlopen({ exports: {} } as NodeModule, nodeFile);
-    console.log(`[ABI check] better_sqlite3.node ABI is compatible (${nodeFile})`);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (msg.includes('NODE_MODULE_VERSION')) {
-      console.error(`[ABI check] ABI mismatch detected: ${msg}`);
-      dialog.showErrorBox(
-        'CodePilot - Native Module ABI Mismatch',
-        `The bundled better-sqlite3 native module was compiled for a different Node.js version.\n\n` +
-        `${msg}\n\n` +
-        `This usually means the build process did not correctly recompile native modules for Electron.\n` +
-        `Please rebuild the application or report this issue.`
-      );
-      app.quit();
-    } else {
-      // Other load errors (missing dependencies, etc.) -- log but don't block
-      console.warn(`[ABI check] Could not verify better_sqlite3.node: ${msg}`);
-    }
-  }
-}
-
-/**
  * Read the user's full shell environment by running a login shell.
  * When Electron is launched from Dock/Finder, process.env is very limited
  * and won't include vars from .zshrc/.bashrc (e.g. API keys).
  */
 function loadUserShellEnv(): Record<string, string> {
-  // Only macOS needs login-shell env loading; Windows/Linux GUI apps inherit full env
-  if (process.platform !== 'darwin') {
-    return {};
-  }
   try {
     const shell = process.env.SHELL || '/bin/zsh';
     const result = execFileSync(shell, ['-ilc', 'env'], {
@@ -155,10 +94,27 @@ function startServer(port: number): ChildProcess {
   const standaloneDir = path.join(process.resourcesPath, 'standalone');
   const serverPath = path.join(standaloneDir, 'server.js');
 
-  // Always use Electron's built-in Node.js in packaged mode.
-  // electron-builder's @electron/rebuild compiles native modules (better-sqlite3)
-  // for Electron's Node ABI, so we must use the matching runtime.
-  const nodePath = process.execPath;
+  // Use system Node.js to avoid Dock icon issue on macOS
+  // System Node.js v22 has the same MODULE_VERSION (127) as Electron 40's Node.js
+  // so better-sqlite3 compiled for Electron will work with system Node.js
+  let nodePath = 'node'; // Use PATH to find node
+
+  // Try to find node in common locations
+  const nodeLocations = [
+    '/usr/local/bin/node',
+    '/opt/homebrew/bin/node',
+    '/usr/bin/node',
+  ];
+
+  for (const location of nodeLocations) {
+    try {
+      execFileSync(location, ['--version'], { stdio: 'pipe' });
+      nodePath = location;
+      break;
+    } catch {
+      // Try next location
+    }
+  }
 
   console.log(`Using Node.js: ${nodePath}`);
   console.log(`Server path: ${serverPath}`);
@@ -167,61 +123,28 @@ function startServer(port: number): ChildProcess {
   serverErrors = [];
 
   const home = os.homedir();
+  const basePath = `/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin`;
   const shellPath = userShellEnv.PATH || process.env.PATH || '';
-  const sep = path.delimiter; // ';' on Windows, ':' on Unix
-
-  let constructedPath: string;
-  if (process.platform === 'win32') {
-    const appData = process.env.APPDATA || path.join(home, 'AppData', 'Roaming');
-    const localAppData = process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local');
-    const winExtra = [
-      path.join(appData, 'npm'),
-      path.join(localAppData, 'npm'),
-      path.join(home, '.npm-global', 'bin'),
-      path.join(home, '.local', 'bin'),
-      path.join(home, '.claude', 'bin'),
-    ];
-    const allParts = [shellPath, ...winExtra].join(sep).split(sep).filter(Boolean);
-    constructedPath = [...new Set(allParts)].join(sep);
-  } else {
-    const basePath = `/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin`;
-    const raw = `${basePath}:${home}/.npm-global/bin:${home}/.local/bin:${home}/.claude/bin:${shellPath}`;
-    const allParts = raw.split(':').filter(Boolean);
-    constructedPath = [...new Set(allParts)].join(':');
-  }
 
   const env: Record<string, string> = {
     ...userShellEnv,
-    ...(process.env as Record<string, string>),
+    ...process.env as Record<string, string>,
     // Ensure user shell env vars override (especially API keys)
     ...userShellEnv,
     PORT: String(port),
     HOSTNAME: '127.0.0.1',
     CLAUDE_GUI_DATA_DIR: path.join(home, '.codepilot'),
-    ELECTRON_RUN_AS_NODE: '1',
     HOME: home,
-    USERPROFILE: home,
-    PATH: constructedPath,
+    PATH: `${basePath}:${home}/.npm-global/bin:${home}/.local/bin:${home}/.claude/bin:${shellPath}`,
   };
 
-  // On Windows, spawn Node.js directly with windowsHide to prevent console flash.
-  // On macOS, spawn via /bin/sh to prevent the Electron binary from appearing
-  // as a separate Dock icon (even with ELECTRON_RUN_AS_NODE=1).
-  let child: ChildProcess;
-  if (process.platform === 'win32') {
-    child = spawn(nodePath, [serverPath], {
-      env,
-      stdio: 'pipe',
-      cwd: standaloneDir,
-      windowsHide: true,
-    });
-  } else {
-    child = spawn('/bin/sh', ['-c', `exec "${nodePath}" "${serverPath}"`], {
-      env,
-      stdio: 'pipe',
-      cwd: standaloneDir,
-    });
-  }
+  // Use system Node.js directly to avoid Dock icon
+  const child = spawn(nodePath, [serverPath], {
+    env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    cwd: standaloneDir,
+    detached: false,
+  });
 
   child.stdout?.on('data', (data: Buffer) => {
     const msg = data.toString().trim();
@@ -247,38 +170,23 @@ function getIconPath(): string {
   if (isDev) {
     return path.join(process.cwd(), 'build', 'icon.png');
   }
-  if (process.platform === 'win32') {
-    return path.join(process.resourcesPath, 'icon.ico');
-  }
   return path.join(process.resourcesPath, 'icon.icns');
 }
 
 function createWindow(port: number) {
-  const windowOptions: Electron.BrowserWindowConstructorOptions = {
+  mainWindow = new BrowserWindow({
     width: 1280,
     height: 860,
     minWidth: 800,
     minHeight: 600,
     icon: getIconPath(),
+    titleBarStyle: 'hiddenInset',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
     },
-  };
-
-  if (process.platform === 'darwin') {
-    windowOptions.titleBarStyle = 'hiddenInset';
-  } else if (process.platform === 'win32') {
-    windowOptions.titleBarStyle = 'hidden';
-    windowOptions.titleBarOverlay = {
-      color: '#00000000',
-      symbolColor: '#888888',
-      height: 44,
-    };
-  }
-
-  mainWindow = new BrowserWindow(windowOptions);
+  });
 
   mainWindow.loadURL(`http://127.0.0.1:${port}`);
 
@@ -294,9 +202,6 @@ function createWindow(port: number) {
 app.whenReady().then(async () => {
   // Load user's full shell environment (API keys, PATH, etc.)
   userShellEnv = loadUserShellEnv();
-
-  // Verify native module ABI compatibility before starting the server
-  checkNativeModuleABI();
 
   // Set macOS Dock icon
   if (process.platform === 'darwin' && app.dock) {

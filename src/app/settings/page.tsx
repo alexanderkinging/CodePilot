@@ -24,6 +24,7 @@ import {
   CodeIcon,
   SlidersHorizontalIcon,
   Loading02Icon,
+  Download01Icon,
 } from "@hugeicons/core-free-icons";
 
 interface SettingsData {
@@ -165,6 +166,71 @@ function ApiConfigSection() {
   );
 }
 
+// --- Import History Section ---
+function ImportHistorySection() {
+  const [importing, setImporting] = useState(false);
+  const [status, setStatus] = useState<{ type: "idle" | "success" | "error"; message?: string }>({ type: "idle" });
+
+  const handleImport = async () => {
+    setImporting(true);
+    setStatus({ type: "idle" });
+    try {
+      const res = await fetch("/api/chat/import", {
+        method: "POST",
+      });
+      const data = await res.json();
+
+      if (res.ok) {
+        setStatus({
+          type: "success",
+          message: `Successfully imported ${data.imported} sessions with ${data.messagesImported || 0} messages`,
+        });
+        setTimeout(() => setStatus({ type: "idle" }), 5000);
+      } else {
+        setStatus({
+          type: "error",
+          message: data.error || "Failed to import history",
+        });
+      }
+    } catch (err) {
+      setStatus({
+        type: "error",
+        message: err instanceof Error ? err.message : "Failed to import history",
+      });
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  return (
+    <div className="rounded-lg border border-border/50 p-4 space-y-4">
+      <div>
+        <Label className="text-sm font-medium">Import Claude CLI History</Label>
+        <p className="text-xs text-muted-foreground">
+          Import your existing Claude CLI conversation history from ~/.claude/history.jsonl.
+          This will create sessions in CodePilot for all your previous conversations.
+        </p>
+      </div>
+      <div className="flex items-center gap-3">
+        <Button onClick={handleImport} disabled={importing} size="sm" className="gap-2">
+          {importing ? (
+            <HugeiconsIcon icon={Loading02Icon} className="h-4 w-4 animate-spin" />
+          ) : (
+            <HugeiconsIcon icon={Download01Icon} className="h-4 w-4" />
+          )}
+          {importing ? "Importing..." : "Import History"}
+        </Button>
+        {status.type === "success" && (
+          <span className="text-sm text-green-600 dark:text-green-400">{status.message}</span>
+        )}
+        {status.type === "error" && (
+          <span className="text-sm text-destructive">{status.message}</span>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // --- Claude CLI Settings Section (manages ~/.claude/settings.json) ---
 function SettingsPageInner() {
   const [settings, setSettings] = useState<SettingsData>({});
@@ -281,6 +347,7 @@ function SettingsPageInner() {
       <div className="flex-1 overflow-auto p-6">
         <div className="max-w-3xl space-y-6">
           <ApiConfigSection />
+          <ImportHistorySection />
 
           {loading ? (
             <div className="flex items-center justify-center py-12">
