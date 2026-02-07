@@ -50,3 +50,10 @@ next-env.d.ts
 # test artifacts
 /playwright-report/
 /test-results/
+
+# build logs
+build.log
+
+# macOS
+.DS_Store
+*.dmg
