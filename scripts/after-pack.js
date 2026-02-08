@@ -24,8 +24,29 @@ module.exports = async function afterPack(context) {
   );
 
   if (!fs.existsSync(rebuiltSource)) {
-    console.warn('[afterPack] Rebuilt better_sqlite3.node not found at', rebuiltSource);
-    return;
+    console.error('[afterPack] ❌ FATAL: Pre-built better-sqlite3 binary not found at', rebuiltSource);
+    console.error('[afterPack] The application will fail to start without this binary.');
+    console.error('[afterPack]');
+    console.error('[afterPack] Please run the following command to build the binary:');
+    console.error('[afterPack]   npm run build:sqlite3');
+    console.error('[afterPack]');
+    console.error('[afterPack] Or if you have already built it, ensure the file exists at:');
+    console.error('[afterPack]  ', rebuiltSource);
+    process.exit(1); // Stop the build process
+  }
+
+  // Verify binary size
+  const stats = fs.statSync(rebuiltSource);
+  const sizeMB = (stats.size / 1024 / 1024).toFixed(2);
+  console.log(`[afterPack] Found pre-built binary (${sizeMB} MB)`);
+
+  if (stats.size < 100000) { // Less than 100KB is suspicious
+    console.error('[afterPack] ❌ FATAL: Binary size is suspiciously small:', sizeMB, 'MB');
+    console.error('[afterPack] Expected size: ~1.5-2.5 MB');
+    console.error('[afterPack] The binary may be corrupted. Please rebuild:');
+    console.error('[afterPack]   rm -rf /tmp/better-sqlite3-node22');
+    console.error('[afterPack]   npm run build:sqlite3');
+    process.exit(1);
   }
 
   // Find all better_sqlite3.node files inside the standalone resources
