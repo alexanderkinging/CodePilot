@@ -153,8 +153,9 @@ function findTranscriptPath(workingDirectory: string, sessionId: string): string
   const claudeDir = path.join(homedir(), '.claude', 'projects');
   if (!existsSync(claudeDir)) return null;
 
-  // Encode project path (replace / with -)
-  const encodedPath = workingDirectory.replace(/\//g, '-');
+  // Encode project path (replace / and _ with -)
+  // Claude CLI replaces both / and _ with - in directory names
+  const encodedPath = workingDirectory.replace(/[/_]/g, '-');
   const projectDir = path.join(claudeDir, encodedPath);
 
   if (!existsSync(projectDir)) return null;
