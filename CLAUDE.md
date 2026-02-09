@@ -102,3 +102,47 @@ npm run build:sqlite3
 ```
 
 **注意**: 构建需要系统安装了编译工具（macOS: Xcode Command Line Tools, Linux: build-essential）
+
+## Port Management
+
+### 开发环境端口管理
+
+CodePilot 开发环境使用 3000 端口（Next.js 默认端口）。为避免端口冲突，项目提供了安全的端口清理机制。
+
+**自动清理**：
+- 运行 `npm run electron:dev` 时会自动执行 `preelectron:dev` 钩子
+- 该钩子会调用 `scripts/free-port.sh` 清理 3000 端口上的监听进程
+- 只清理 **LISTEN** 状态的进程，不影响 **ESTABLISHED** 状态的客户端连接
+
+**手动清理**：
+```bash
+# 清理 3000 端口
+bash scripts/free-port.sh 3000
+
+# 清理其他端口
+bash scripts/free-port.sh 8080
+```
+
+### 重要说明：LISTEN vs ESTABLISHED
+
+**LISTEN 状态**：
+- 进程在本地监听端口，等待连接（如 Next.js 开发服务器）
+- 会与 CodePilot 冲突，需要清理
+
+**ESTABLISHED 状态**：
+- 进程作为客户端连接到远程服务器（如 Claude Code CLI 连接到远程服务器）
+- 不会与 CodePilot 冲突，**不应清理**
+
+**示例**：
+```bash
+# Claude Code CLI 连接到远程服务器（不冲突）
+node     12345  user  TCP 127.0.0.1:xxxxx->175.178.49.176:3000 (ESTABLISHED)
+
+# Next.js 监听本地 3000 端口（会冲突）
+node     67890  user  TCP 127.0.0.1:3000 (LISTEN)
+```
+
+**警告**：
+- 不要手动 kill Claude Code CLI 进程
+- 不要使用 `lsof -i :3000` 查找进程（会包含 ESTABLISHED 连接）
+- 始终使用 `scripts/free-port.sh` 进行安全清理
