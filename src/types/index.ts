@@ -94,6 +94,51 @@ export interface Setting {
 }
 
 // ==========================================
+// API Provider Types
+// ==========================================
+
+export interface ApiProvider {
+  id: string;
+  name: string;
+  provider_type: string; // 'anthropic' | 'openrouter' | 'bedrock' | 'vertex' | 'custom'
+  base_url: string;
+  api_key: string;
+  is_active: number; // SQLite boolean: 0 or 1
+  sort_order: number;
+  extra_env: string; // JSON string of Record<string, string>
+  notes: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateProviderRequest {
+  name: string;
+  provider_type?: string;
+  base_url?: string;
+  api_key?: string;
+  extra_env?: string;
+  notes?: string;
+}
+
+export interface UpdateProviderRequest {
+  name?: string;
+  provider_type?: string;
+  base_url?: string;
+  api_key?: string;
+  extra_env?: string;
+  notes?: string;
+  sort_order?: number;
+}
+
+export interface ProvidersResponse {
+  providers: ApiProvider[];
+}
+
+export interface ProviderResponse {
+  provider: ApiProvider;
+}
+
+// ==========================================
 // Token Usage
 // ==========================================
 
@@ -348,6 +393,30 @@ export const SETTING_KEYS = {
 } as const;
 
 // ==========================================
+// File Attachment Types
+// ==========================================
+
+export interface FileAttachment {
+  id: string;
+  name: string;
+  type: string; // MIME type
+  size: number;
+  data: string; // base64 encoded content
+}
+
+// Check if a MIME type is an image
+export function isImageFile(type: string): boolean {
+  return type.startsWith('image/');
+}
+
+// Format bytes into human-readable size
+export function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+// ==========================================
 // Claude Client Types
 // ==========================================
 
@@ -361,4 +430,5 @@ export interface ClaudeStreamOptions {
   mcpServers?: Record<string, MCPServerConfig>;
   abortController?: AbortController;
   permissionMode?: string;
+  files?: FileAttachment[];
 }

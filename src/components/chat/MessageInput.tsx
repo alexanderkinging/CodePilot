@@ -11,6 +11,8 @@ import {
   HelpCircleIcon,
   ArrowDown01Icon,
   CommandLineIcon,
+  Attachment01Icon,
+  Cancel01Icon,
 } from "@hugeicons/core-free-icons";
 import { cn } from '@/lib/utils';
 import { FolderPicker } from './FolderPicker';
@@ -21,11 +23,27 @@ import {
   PromptInputTools,
   PromptInputButton,
   PromptInputSubmit,
+  usePromptInputAttachments,
 } from '@/components/ai-elements/prompt-input';
 import type { ChatStatus } from 'ai';
+import type { FileAttachment } from '@/types';
+import { nanoid } from 'nanoid';
+
+// Accepted file types for upload
+const ACCEPTED_FILE_TYPES = [
+  'image/jpeg', 'image/png', 'image/gif', 'image/webp',
+  'application/pdf',
+  'text/*',
+  '.md', '.json', '.csv', '.ts', '.tsx', '.js', '.jsx', '.py', '.go', '.rs',
+].join(',');
+
+// Max file sizes
+const MAX_IMAGE_SIZE = 5 * 1024 * 1024;  // 5MB
+const MAX_DOC_SIZE = 10 * 1024 * 1024;   // 10MB
+const MAX_FILE_SIZE = MAX_DOC_SIZE;       // Use larger limit; we validate per-type in conversion
 
 interface MessageInputProps {
-  onSend: (content: string) => void;
+  onSend: (content: string, files?: FileAttachment[]) => void;
   onCommand?: (command: string) => void;
   onStop?: () => void;
   disabled?: boolean;
@@ -44,19 +62,36 @@ interface PopoverItem {
   value: string;
   description?: string;
   builtIn?: boolean;
+  immediate?: boolean;
+}
+
+interface CommandBadge {
+  command: string;
+  label: string;
+  description: string;
+  isSkill: boolean;
 }
 
 type PopoverMode = 'file' | 'skill' | null;
 
+// Expansion prompts for CLI-only commands (not natively supported by SDK).
+// SDK-native commands (/compact, /init, /review) are sent as-is — the SDK handles them directly.
+const COMMAND_PROMPTS: Record<string, string> = {
+  '/doctor': 'Run diagnostic checks on this project. Check system health, dependencies, configuration files, and report any issues.',
+  '/terminal-setup': 'Help me configure my terminal for optimal use with Claude Code. Check current setup and suggest improvements.',
+  '/memory': 'Show the current CLAUDE.md project memory file and help me review or edit it.',
+};
+
 const BUILT_IN_COMMANDS: PopoverItem[] = [
-  { label: 'help', value: '/help', description: 'Show help information', builtIn: true },
-  { label: 'clear', value: '/clear', description: 'Clear conversation', builtIn: true },
+  { label: 'help', value: '/help', description: 'Show available commands and tips', builtIn: true, immediate: true },
+  { label: 'clear', value: '/clear', description: 'Clear conversation history', builtIn: true, immediate: true },
+  { label: 'cost', value: '/cost', description: 'Show token usage statistics', builtIn: true, immediate: true },
   { label: 'compact', value: '/compact', description: 'Compress conversation context', builtIn: true },
-  { label: 'cost', value: '/cost', description: 'Show token usage', builtIn: true },
-  { label: 'doctor', value: '/doctor', description: 'Check system health', builtIn: true },
-  { label: 'init', value: '/init', description: 'Initialize CLAUDE.md', builtIn: true },
-  { label: 'review', value: '/review', description: 'Code review', builtIn: true },
-  { label: 'terminal-setup', value: '/terminal-setup', description: 'Terminal configuration', builtIn: true },
+  { label: 'doctor', value: '/doctor', description: 'Diagnose project health', builtIn: true },
+  { label: 'init', value: '/init', description: 'Initialize CLAUDE.md for project', builtIn: true },
+  { label: 'review', value: '/review', description: 'Review code quality', builtIn: true },
+  { label: 'terminal-setup', value: '/terminal-setup', description: 'Configure terminal settings', builtIn: true },
+  { label: 'memory', value: '/memory', description: 'Edit project memory file', builtIn: true },
 ];
 
 interface ModeOption {
@@ -72,11 +107,171 @@ const MODE_OPTIONS: ModeOption[] = [
   { value: 'ask', label: 'Ask', icon: HelpCircleIcon, description: 'Answer questions only' },
 ];
 
-const MODEL_OPTIONS = [
+// Default Claude model options — labels are dynamically overridden by active provider
+const DEFAULT_MODEL_OPTIONS = [
   { value: 'sonnet', label: 'Sonnet 4.5' },
   { value: 'opus', label: 'Opus 4.6' },
   { value: 'haiku', label: 'Haiku 4.5' },
 ];
+
+// Provider-specific model label mappings (alias → display name)
+const PROVIDER_MODEL_LABELS: Record<string, Record<string, string>> = {
+  // GLM Coding Plan (Z.AI / 智谱)
+  'https://api.z.ai/api/anthropic': {
+    sonnet: 'GLM-4.7',
+    opus: 'GLM-4.7',
+    haiku: 'GLM-4.5-Air',
+  },
+  'https://open.bigmodel.cn/api/anthropic': {
+    sonnet: 'GLM-4.7',
+    opus: 'GLM-4.7',
+    haiku: 'GLM-4.5-Air',
+  },
+  // Kimi Coding Plan
+  'https://api.kimi.com/coding/': {
+    sonnet: 'Kimi K2.5',
+    opus: 'Kimi K2.5',
+    haiku: 'Kimi K2.5',
+  },
+  // Moonshot Open Platform
+  'https://api.moonshot.ai/anthropic': {
+    sonnet: 'Kimi K2.5',
+    opus: 'Kimi K2.5',
+    haiku: 'Kimi K2.5',
+  },
+  'https://api.moonshot.cn/anthropic': {
+    sonnet: 'Kimi K2.5',
+    opus: 'Kimi K2.5',
+    haiku: 'Kimi K2.5',
+  },
+  // MiniMax Coding Plan
+  'https://api.minimaxi.com/anthropic': {
+    sonnet: 'MiniMax-M2.1',
+    opus: 'MiniMax-M2.1',
+    haiku: 'MiniMax-M2.1',
+  },
+  'https://api.minimax.io/anthropic': {
+    sonnet: 'MiniMax-M2.1',
+    opus: 'MiniMax-M2.1',
+    haiku: 'MiniMax-M2.1',
+  },
+  // OpenRouter — keeps Claude names, provider handles routing
+  'https://openrouter.ai/api': {
+    sonnet: 'Sonnet 4.5',
+    opus: 'Opus 4.6',
+    haiku: 'Haiku 4.5',
+  },
+};
+
+/**
+ * Convert a data URL to a FileAttachment object.
+ */
+async function dataUrlToFileAttachment(
+  dataUrl: string,
+  filename: string,
+  mediaType: string,
+): Promise<FileAttachment> {
+  // data:image/png;base64,<data>  — extract the base64 part
+  const base64 = dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
+
+  // Estimate raw size from base64 length
+  const size = Math.ceil((base64.length * 3) / 4);
+
+  return {
+    id: nanoid(),
+    name: filename,
+    type: mediaType || 'application/octet-stream',
+    size,
+    data: base64,
+  };
+}
+
+/**
+ * Submit button that's aware of file attachments. Must be rendered inside PromptInput.
+ */
+function FileAwareSubmitButton({
+  status,
+  onStop,
+  disabled,
+  inputValue,
+  hasBadge,
+}: {
+  status: ChatStatus;
+  onStop?: () => void;
+  disabled?: boolean;
+  inputValue: string;
+  hasBadge: boolean;
+}) {
+  const attachments = usePromptInputAttachments();
+  const hasFiles = attachments.files.length > 0;
+  const isStreaming = status === 'streaming' || status === 'submitted';
+
+  return (
+    <PromptInputSubmit
+      status={status}
+      onStop={onStop}
+      disabled={disabled || (!isStreaming && !inputValue.trim() && !hasBadge && !hasFiles)}
+    />
+  );
+}
+
+/**
+ * Attachment button that opens the file dialog. Must be rendered inside PromptInput.
+ */
+function AttachFileButton() {
+  const attachments = usePromptInputAttachments();
+
+  return (
+    <PromptInputButton
+      onClick={() => attachments.openFileDialog()}
+      tooltip="Attach files"
+    >
+      <HugeiconsIcon icon={Attachment01Icon} className="h-3.5 w-3.5" />
+    </PromptInputButton>
+  );
+}
+
+/**
+ * Capsule display for attached files, rendered inside PromptInput context.
+ */
+function FileAttachmentsCapsules() {
+  const attachments = usePromptInputAttachments();
+
+  if (attachments.files.length === 0) return null;
+
+  return (
+    <div className="flex w-full flex-wrap items-center gap-1.5 px-3 pt-2 pb-0 order-first">
+      {attachments.files.map((file) => {
+        const isImage = file.mediaType?.startsWith('image/');
+        return (
+          <span
+            key={file.id}
+            className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 pl-2 pr-1 py-0.5 text-xs font-medium border border-emerald-500/20"
+          >
+            {isImage && file.url && (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                src={file.url}
+                alt={file.filename || 'image'}
+                className="h-5 w-5 rounded object-cover"
+              />
+            )}
+            <span className="max-w-[120px] truncate text-[11px]">
+              {file.filename || 'file'}
+            </span>
+            <button
+              type="button"
+              onClick={() => attachments.remove(file.id)}
+              className="ml-0.5 rounded-full p-0.5 hover:bg-emerald-500/20 transition-colors"
+            >
+              <HugeiconsIcon icon={Cancel01Icon} className="h-3 w-3" />
+            </button>
+          </span>
+        );
+      })}
+    </div>
+  );
+}
 
 export function MessageInput({
   onSend,
@@ -106,6 +301,35 @@ export function MessageInput({
   const [modeMenuOpen, setModeMenuOpen] = useState(false);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [inputValue, setInputValue] = useState('');
+  const [badge, setBadge] = useState<CommandBadge | null>(null);
+  const [activeProviderBaseUrl, setActiveProviderBaseUrl] = useState<string | null>(null);
+  const [activeProviderName, setActiveProviderName] = useState<string | null>(null);
+
+  // Fetch active provider to adapt model labels
+  useEffect(() => {
+    fetch('/api/providers')
+      .then((r) => r.json())
+      .then((data) => {
+        const active = (data.providers || []).find((p: { is_active: number }) => p.is_active === 1);
+        if (active) {
+          setActiveProviderBaseUrl(active.base_url || null);
+          setActiveProviderName(active.name || null);
+        } else {
+          setActiveProviderBaseUrl(null);
+          setActiveProviderName(null);
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  // Compute model options based on active provider
+  const MODEL_OPTIONS = DEFAULT_MODEL_OPTIONS.map((opt) => {
+    if (activeProviderBaseUrl && PROVIDER_MODEL_LABELS[activeProviderBaseUrl]) {
+      const label = PROVIDER_MODEL_LABELS[activeProviderBaseUrl][opt.value];
+      if (label) return { ...opt, label };
+    }
+    return opt;
+  });
 
   // Fetch files for @ mention
   const fetchFiles = useCallback(async (filter: string) => {
@@ -144,7 +368,7 @@ export function MessageInput({
         const data = await res.json();
         const skills = data.skills || [];
         apiSkills = skills
-          .filter((s: { name: string; enabled: boolean }) => s.enabled && s.name.toLowerCase().includes(filter.toLowerCase()))
+          .filter((s: { name: string }) => s.name.toLowerCase().includes(filter.toLowerCase()))
           .map((s: { name: string; description: string }) => ({
             label: s.name,
             value: `/${s.name}`,
@@ -168,23 +392,44 @@ export function MessageInput({
     setTriggerPos(null);
   }, []);
 
+  // Remove active badge
+  const removeBadge = useCallback(() => {
+    setBadge(null);
+    setTimeout(() => textareaRef.current?.focus(), 0);
+  }, []);
+
   // Insert selected item
   const insertItem = useCallback((item: PopoverItem) => {
     if (triggerPos === null) return;
 
-    // Built-in commands: execute immediately
-    if (item.builtIn && onCommand) {
+    // Immediate built-in commands: execute right away
+    if (item.builtIn && item.immediate && onCommand) {
       setInputValue('');
       closePopover();
       onCommand(item.value);
       return;
     }
 
+    // Non-immediate commands (prompt-based built-ins and skills): show as badge
+    if (popoverMode === 'skill') {
+      setBadge({
+        command: item.value,
+        label: item.label,
+        description: item.description || '',
+        isSkill: !item.builtIn,
+      });
+      setInputValue('');
+      closePopover();
+      setTimeout(() => textareaRef.current?.focus(), 0);
+      return;
+    }
+
+    // File mention: insert into text
     const currentVal = inputValue;
     const before = currentVal.slice(0, triggerPos);
-    const cursorEnd = triggerPos + (popoverMode === 'file' ? popoverFilter.length + 1 : popoverFilter.length + 1);
+    const cursorEnd = triggerPos + popoverFilter.length + 1;
     const after = currentVal.slice(cursorEnd);
-    const insertText = popoverMode === 'file' ? `@${item.value} ` : `${item.value} `;
+    const insertText = `@${item.value} `;
 
     setInputValue(before + insertText + after);
     closePopover();
@@ -234,23 +479,111 @@ export function MessageInput({
     }
   }, [fetchFiles, fetchSkills, popoverMode, closePopover]);
 
-  const handleSubmit = useCallback((_msg: { text: string; files: unknown[] }, e: FormEvent<HTMLFormElement>) => {
+  const handleSubmit = useCallback(async (msg: { text: string; files: Array<{ type: string; url: string; filename?: string; mediaType?: string }> }, e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     const content = inputValue.trim();
-    if (!content || disabled) return;
 
     closePopover();
 
-    // Check if it's a built-in command
-    const builtInCmd = BUILT_IN_COMMANDS.find(cmd => cmd.value === content);
-    if (builtInCmd && onCommand) {
-      onCommand(content);
-    } else {
-      onSend(content);
+    // Convert PromptInput FileUIParts (with data URLs) to FileAttachment[]
+    const convertFiles = async (): Promise<FileAttachment[]> => {
+      if (!msg.files || msg.files.length === 0) return [];
+
+      const attachments: FileAttachment[] = [];
+      for (const file of msg.files) {
+        if (!file.url) continue;
+        try {
+          const attachment = await dataUrlToFileAttachment(
+            file.url,
+            file.filename || 'file',
+            file.mediaType || 'application/octet-stream',
+          );
+          // Enforce per-type size limits
+          const isImage = attachment.type.startsWith('image/');
+          const sizeLimit = isImage ? MAX_IMAGE_SIZE : MAX_DOC_SIZE;
+          if (attachment.size <= sizeLimit) {
+            attachments.push(attachment);
+          }
+        } catch {
+          // Skip files that fail conversion
+        }
+      }
+      return attachments;
+    };
+
+    // If badge is active, expand the command/skill and send
+    if (badge) {
+      let expandedPrompt = '';
+
+      if (badge.isSkill) {
+        // Fetch skill content from API
+        try {
+          const res = await fetch(`/api/skills/${encodeURIComponent(badge.label)}`);
+          if (res.ok) {
+            const data = await res.json();
+            expandedPrompt = data.skill?.content || '';
+          }
+        } catch {
+          // Fallback: use command name
+        }
+      } else {
+        // Built-in prompt command expansion
+        expandedPrompt = COMMAND_PROMPTS[badge.command] || '';
+      }
+
+      const finalPrompt = content
+        ? `${expandedPrompt}\n\nUser context: ${content}`
+        : expandedPrompt || badge.command;
+
+      const files = await convertFiles();
+      setBadge(null);
+      setInputValue('');
+      onSend(finalPrompt, files.length > 0 ? files : undefined);
+      return;
     }
 
+    const files = await convertFiles();
+    const hasFiles = files.length > 0;
+
+    if ((!content && !hasFiles) || disabled) return;
+
+    // Check if it's a direct slash command typed in the input
+    if (content.startsWith('/') && !hasFiles) {
+      const cmd = BUILT_IN_COMMANDS.find(c => c.value === content);
+      if (cmd) {
+        if (cmd.immediate && onCommand) {
+          setInputValue('');
+          onCommand(content);
+          return;
+        }
+        // Non-immediate: show as badge for user to add context
+        setBadge({
+          command: cmd.value,
+          label: cmd.label,
+          description: cmd.description || '',
+          isSkill: false,
+        });
+        setInputValue('');
+        return;
+      }
+
+      // Not a built-in command — treat as a skill
+      const skillName = content.slice(1);
+      if (skillName) {
+        setBadge({
+          command: content,
+          label: skillName,
+          description: '',
+          isSkill: true,
+        });
+        setInputValue('');
+        return;
+      }
+    }
+
+    onSend(content || 'Please review the attached file(s).', hasFiles ? files : undefined);
     setInputValue('');
-  }, [inputValue, onSend, onCommand, disabled, closePopover]);
+  }, [inputValue, onSend, onCommand, disabled, closePopover, badge]);
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -279,8 +612,22 @@ export function MessageInput({
           return;
         }
       }
+
+      // Backspace removes badge when input is empty
+      if (e.key === 'Backspace' && badge && !inputValue) {
+        e.preventDefault();
+        removeBadge();
+        return;
+      }
+
+      // Escape removes badge
+      if (e.key === 'Escape' && badge) {
+        e.preventDefault();
+        removeBadge();
+        return;
+      }
     },
-    [popoverMode, popoverItems, selectedIndex, insertItem, closePopover]
+    [popoverMode, popoverItems, popoverFilter, selectedIndex, insertItem, closePopover, badge, inputValue, removeBadge]
   );
 
   // Click outside to close popover
@@ -351,6 +698,7 @@ export function MessageInput({
                 {filteredItems.map((item, i) => (
                   <button
                     key={item.value}
+                    ref={i === selectedIndex ? (el) => { el?.scrollIntoView({ block: 'nearest' }); } : undefined}
                     className={cn(
                       "flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm transition-colors",
                       i === selectedIndex ? "bg-accent text-accent-foreground" : "hover:bg-accent/50"
@@ -385,10 +733,35 @@ export function MessageInput({
           {/* PromptInput replaces the old input area */}
           <PromptInput
             onSubmit={handleSubmit}
+            accept={ACCEPTED_FILE_TYPES}
+            multiple
+            maxFileSize={MAX_FILE_SIZE}
           >
+            {/* Command badge */}
+            {badge && (
+              <div className="flex w-full items-center gap-1.5 px-3 pt-2.5 pb-0 order-first">
+                <span className="inline-flex items-center gap-1.5 rounded-full bg-blue-500/10 text-blue-600 dark:text-blue-400 pl-2.5 pr-1.5 py-1 text-xs font-medium border border-blue-500/20">
+                  <span className="font-mono">{badge.command}</span>
+                  {badge.description && (
+                    <span className="text-blue-500/60 dark:text-blue-400/60 text-[10px]">{badge.description}</span>
+                  )}
+                  <button
+                    type="button"
+                    onClick={removeBadge}
+                    className="ml-0.5 rounded-full p-0.5 hover:bg-blue-500/20 transition-colors"
+                  >
+                    <svg className="h-3 w-3" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M3 3l6 6M9 3l-6 6" />
+                    </svg>
+                  </button>
+                </span>
+              </div>
+            )}
+            {/* File attachment capsules */}
+            <FileAttachmentsCapsules />
             <PromptInputTextarea
               ref={textareaRef}
-              placeholder="Message Claude..."
+              placeholder={badge ? "Add details (optional), then press Enter..." : "Message Claude..."}
               value={inputValue}
               onChange={(e) => handleInputChange(e.currentTarget.value)}
               onKeyDown={handleKeyDown}
@@ -397,6 +770,9 @@ export function MessageInput({
             />
             <PromptInputFooter>
               <PromptInputTools>
+                {/* Attach file button */}
+                <AttachFileButton />
+
                 {/* Folder picker button */}
                 <PromptInputButton
                   onClick={() => setFolderPickerOpen(true)}
@@ -488,10 +864,12 @@ export function MessageInput({
                   )}
                 </div>
 
-                <PromptInputSubmit
+                <FileAwareSubmitButton
                   status={chatStatus}
                   onStop={onStop}
-                  disabled={disabled || (!isStreaming && !inputValue.trim())}
+                  disabled={disabled}
+                  inputValue={inputValue}
+                  hasBadge={!!badge}
                 />
               </div>
             </PromptInputFooter>

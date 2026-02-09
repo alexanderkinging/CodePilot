@@ -1,6 +1,6 @@
 {
   "name": "codepilot",
-  "version": "0.2.3",
+  "version": "0.5.1",
   "private": true,
   "main": "dist-electron/main.js",
   "scripts": {
@@ -11,9 +11,9 @@
     "electron:dev": "concurrently -k \"next dev\" \"wait-on http://localhost:3000 && electron .\"",
     "electron:build": "next build && node scripts/build-electron.mjs",
     "electron:pack": "npm run electron:build && electron-builder --config electron-builder.yml",
-    "electron:pack:mac": "npm run build:sqlite3 && npm run electron:build && electron-builder --mac --config electron-builder.yml",
-    "electron:pack:win": "npm run build:sqlite3 && npm run electron:build && electron-builder --win --config electron-builder.yml",
-    "build:sqlite3": "node scripts/build-sqlite3.js",
+    "electron:pack:mac": "npm run electron:build && electron-builder --mac --config electron-builder.yml",
+    "electron:pack:win": "npm run electron:build && electron-builder --win --config electron-builder.yml",
+    "electron:pack:linux": "npm run electron:build && electron-builder --linux --config electron-builder.yml",
     "install:local": "bash scripts/install-local.sh"
   },
   "dependencies": {

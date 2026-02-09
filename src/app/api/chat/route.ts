@@ -1,15 +1,15 @@
 import { NextRequest } from 'next/server';
 import { streamClaude } from '@/lib/claude-client';
 import { addMessage, getSession, updateSessionTitle, updateSdkSessionId, getSetting } from '@/lib/db';
-import type { SendMessageRequest, SSEEvent, TokenUsage } from '@/types';
+import type { SendMessageRequest, SSEEvent, TokenUsage, MessageContentBlock, FileAttachment } from '@/types';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 export async function POST(request: NextRequest) {
   try {
-    const body: SendMessageRequest = await request.json();
-    const { session_id, content, model, mode } = body;
+    const body: SendMessageRequest & { files?: FileAttachment[] } = await request.json();
+    const { session_id, content, model, mode, files } = body;
 
     if (!session_id || !content) {
       return new Response(JSON.stringify({ error: 'session_id and content are required' }), {
@@ -63,6 +63,17 @@ export async function POST(request: NextRequest) {
       abortController.abort();
     });
 
+    // Convert file attachments to the format expected by streamClaude
+    const fileAttachments: FileAttachment[] | undefined = files && files.length > 0
+      ? files.map((f, i) => ({
+          id: f.id || `file-${Date.now()}-${i}`,
+          name: f.name,
+          type: f.type,
+          size: f.size,
+          data: f.data,
+        }))
+      : undefined;
+
     // Stream Claude response, using SDK session ID for resume if available
     const stream = streamClaude({
       prompt: content,
@@ -73,6 +84,7 @@ export async function POST(request: NextRequest) {
       workingDirectory: session.working_directory || undefined,
       abortController,
       permissionMode,
+      files: fileAttachments,
     });
 
     // Tee the stream: one for client, one for collecting the response
@@ -99,7 +111,8 @@ export async function POST(request: NextRequest) {
 
 async function collectStreamResponse(stream: ReadableStream<string>, sessionId: string) {
   const reader = stream.getReader();
-  let fullText = '';
+  const contentBlocks: MessageContentBlock[] = [];
+  let currentText = '';
   let tokenUsage: TokenUsage | null = null;
 
   try {
@@ -115,7 +128,36 @@ async function collectStreamResponse(stream: ReadableStream<string>, sessionId: 
             if (event.type === 'permission_request' || event.type === 'tool_output') {
               // Skip permission_request and tool_output events - not saved as message content
             } else if (event.type === 'text') {
-              fullText += event.data;
+              currentText += event.data;
+            } else if (event.type === 'tool_use') {
+              // Flush any accumulated text before the tool use block
+              if (currentText.trim()) {
+                contentBlocks.push({ type: 'text', text: currentText });
+                currentText = '';
+              }
+              try {
+                const toolData = JSON.parse(event.data);
+                contentBlocks.push({
+                  type: 'tool_use',
+                  id: toolData.id,
+                  name: toolData.name,
+                  input: toolData.input,
+                });
+              } catch {
+                // skip malformed tool_use data
+              }
+            } else if (event.type === 'tool_result') {
+              try {
+                const resultData = JSON.parse(event.data);
+                contentBlocks.push({
+                  type: 'tool_result',
+                  tool_use_id: resultData.tool_use_id,
+                  content: resultData.content,
+                  is_error: resultData.is_error || false,
+                });
+              } catch {
+                // skip malformed tool_result data
+              }
             } else if (event.type === 'status') {
               // Capture SDK session_id from init event and persist it
               try {
@@ -147,18 +189,55 @@ async function collectStreamResponse(stream: ReadableStream<string>, sessionId: 
       }
     }
 
-    if (fullText.trim()) {
-      addMessage(
-        sessionId,
-        'assistant',
-        fullText.trim(),
-        tokenUsage ? JSON.stringify(tokenUsage) : null,
+    // Flush any remaining text
+    if (currentText.trim()) {
+      contentBlocks.push({ type: 'text', text: currentText });
+    }
+
+    if (contentBlocks.length > 0) {
+      // If the message is text-only (no tool calls), store as plain text
+      // for backward compatibility with existing message rendering.
+      // If it contains tool calls, store as structured JSON.
+      const hasToolBlocks = contentBlocks.some(
+        (b) => b.type === 'tool_use' || b.type === 'tool_result'
       );
+
+      const content = hasToolBlocks
+        ? JSON.stringify(contentBlocks)
+        : contentBlocks
+            .filter((b): b is Extract<MessageContentBlock, { type: 'text' }> => b.type === 'text')
+            .map((b) => b.text)
+            .join('')
+            .trim();
+
+      if (content) {
+        addMessage(
+          sessionId,
+          'assistant',
+          content,
+          tokenUsage ? JSON.stringify(tokenUsage) : null,
+        );
+      }
     }
   } catch {
     // Stream reading error - best effort save
-    if (fullText.trim()) {
-      addMessage(sessionId, 'assistant', fullText.trim());
+    if (currentText.trim()) {
+      contentBlocks.push({ type: 'text', text: currentText });
+    }
+    if (contentBlocks.length > 0) {
+      const hasToolBlocks = contentBlocks.some(
+        (b) => b.type === 'tool_use' || b.type === 'tool_result'
+      );
+      const content = hasToolBlocks
+        ? JSON.stringify(contentBlocks)
+        : contentBlocks
+            .filter((b): b is Extract<MessageContentBlock, { type: 'text' }> => b.type === 'text')
+            .map((b) => b.text)
+            .join('')
+            .trim();
+      if (content) {
+        addMessage(sessionId, 'assistant', content);
+      }
     }
   }
 }

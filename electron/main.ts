@@ -1,23 +1,87 @@
-import { app, BrowserWindow, nativeImage, dialog } from 'electron';
+import { app, BrowserWindow, nativeImage, dialog, session, utilityProcess } from 'electron';
 import path from 'path';
-import { spawn, execFileSync, ChildProcess } from 'child_process';
+import { execFileSync } from 'child_process';
+import fs from 'fs';
 import net from 'net';
 import os from 'os';
 
 let mainWindow: BrowserWindow | null = null;
-let serverProcess: ChildProcess | null = null;
+let serverProcess: Electron.UtilityProcess | null = null;
 let serverPort: number | null = null;
 let serverErrors: string[] = [];
+let serverExited = false;
+let serverExitCode: number | null = null;
 let userShellEnv: Record<string, string> = {};
 
 const isDev = !app.isPackaged;
 
 /**
+ * Verify that better_sqlite3.node in standalone resources is compatible
+ * with this Electron runtime's ABI. If it was built for a different
+ * Node.js ABI (e.g. system Node v22 ABI 127 vs Electron's ABI 143),
+ * show a clear error instead of a cryptic MODULE_NOT_FOUND crash.
+ */
+function checkNativeModuleABI(): void {
+  if (isDev) return; // Skip in dev mode
+
+  const standaloneDir = path.join(process.resourcesPath, 'standalone');
+
+  // Find better_sqlite3.node recursively
+  function findNodeFile(dir: string): string | null {
+    if (!fs.existsSync(dir)) return null;
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        const found = findNodeFile(fullPath);
+        if (found) return found;
+      } else if (entry.name === 'better_sqlite3.node') {
+        return fullPath;
+      }
+    }
+    return null;
+  }
+
+  const nodeFile = findNodeFile(path.join(standaloneDir, 'node_modules'));
+  if (!nodeFile) {
+    console.warn('[ABI check] better_sqlite3.node not found in standalone resources');
+    return;
+  }
+
+  try {
+    // Attempt to load the native module to verify ABI compatibility
+    process.dlopen({ exports: {} } as NodeModule, nodeFile);
+    console.log(`[ABI check] better_sqlite3.node ABI is compatible (${nodeFile})`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes('NODE_MODULE_VERSION')) {
+      console.error(`[ABI check] ABI mismatch detected: ${msg}`);
+      dialog.showErrorBox(
+        'CodePilot - Native Module ABI Mismatch',
+        `The bundled better-sqlite3 native module was compiled for a different Node.js version.\n\n` +
+        `${msg}\n\n` +
+        `This usually means the build process did not correctly recompile native modules for Electron.\n` +
+        `Please rebuild the application or report this issue.`
+      );
+      app.quit();
+    } else {
+      // Other load errors (missing dependencies, etc.) -- log but don't block
+      console.warn(`[ABI check] Could not verify better_sqlite3.node: ${msg}`);
+    }
+  }
+}
+
+/**
  * Read the user's full shell environment by running a login shell.
- * When Electron is launched from Dock/Finder, process.env is very limited
- * and won't include vars from .zshrc/.bashrc (e.g. API keys).
+ * When Electron is launched from Dock/Finder (macOS) or desktop launcher
+ * (Linux), process.env is very limited and won't include vars from
+ * .zshrc/.bashrc (e.g. API keys, nvm PATH).
  */
 function loadUserShellEnv(): Record<string, string> {
+  // Windows GUI apps inherit the full user environment
+  if (process.platform === 'win32') {
+    return {};
+  }
   try {
     const shell = process.env.SHELL || '/bin/zsh';
     const result = execFileSync(shell, ['-ilc', 'env'], {
@@ -63,9 +127,9 @@ async function waitForServer(port: number, timeout = 30000): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < timeout) {
     // If the server process already exited, fail fast
-    if (serverProcess && serverProcess.exitCode !== null) {
+    if (serverExited) {
       throw new Error(
-        `Server process exited with code ${serverProcess.exitCode}.\n\n${serverErrors.join('\n')}`
+        `Server process exited with code ${serverExitCode}.\n\n${serverErrors.join('\n')}`
       );
     }
     try {
@@ -90,37 +154,16 @@ async function waitForServer(port: number, timeout = 30000): Promise<void> {
   );
 }
 
-function startServer(port: number): ChildProcess {
+function startServer(port: number): Electron.UtilityProcess {
   const standaloneDir = path.join(process.resourcesPath, 'standalone');
   const serverPath = path.join(standaloneDir, 'server.js');
 
-  // Use system Node.js to avoid Dock icon issue on macOS
-  // System Node.js v22 has the same MODULE_VERSION (127) as Electron 40's Node.js
-  // so better-sqlite3 compiled for Electron will work with system Node.js
-  let nodePath = 'node'; // Use PATH to find node
-
-  // Try to find node in common locations
-  const nodeLocations = [
-    '/usr/local/bin/node',
-    '/opt/homebrew/bin/node',
-    '/usr/bin/node',
-  ];
-
-  for (const location of nodeLocations) {
-    try {
-      execFileSync(location, ['--version'], { stdio: 'pipe' });
-      nodePath = location;
-      break;
-    } catch {
-      // Try next location
-    }
-  }
-
-  console.log(`Using Node.js: ${nodePath}`);
   console.log(`Server path: ${serverPath}`);
   console.log(`Standalone dir: ${standaloneDir}`);
 
   serverErrors = [];
+  serverExited = false;
+  serverExitCode = null;
 
   const home = os.homedir();
   const basePath = `/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin`;
@@ -138,12 +181,13 @@ function startServer(port: number): ChildProcess {
     PATH: `${basePath}:${home}/.npm-global/bin:${home}/.local/bin:${home}/.claude/bin:${shellPath}`,
   };
 
-  // Use system Node.js directly to avoid Dock icon
-  const child = spawn(nodePath, [serverPath], {
+  // Use Electron's utilityProcess to run the server in a child process
+  // without spawning a separate Dock icon on macOS.
+  const child = utilityProcess.fork(serverPath, [], {
     env,
-    stdio: ['ignore', 'pipe', 'pipe'],
     cwd: standaloneDir,
-    detached: false,
+    stdio: 'pipe',
+    serviceName: 'codepilot-server',
   });
 
   child.stdout?.on('data', (data: Buffer) => {
@@ -160,6 +204,8 @@ function startServer(port: number): ChildProcess {
 
   child.on('exit', (code) => {
     console.log(`Server process exited with code ${code}`);
+    serverExited = true;
+    serverExitCode = code;
     serverProcess = null;
   });
 
@@ -169,6 +215,12 @@ function startServer(port: number): ChildProcess {
 function getIconPath(): string {
   if (isDev) {
     return path.join(process.cwd(), 'build', 'icon.png');
+  }
+  if (process.platform === 'win32') {
+    return path.join(process.resourcesPath, 'icon.ico');
+  }
+  if (process.platform === 'linux') {
+    return path.join(process.resourcesPath, 'icon.png');
   }
   return path.join(process.resourcesPath, 'icon.icns');
 }
@@ -202,6 +254,29 @@ function createWindow(port: number) {
 app.whenReady().then(async () => {
   // Load user's full shell environment (API keys, PATH, etc.)
   userShellEnv = loadUserShellEnv();
+
+  // Verify native module ABI compatibility before starting the server
+  checkNativeModuleABI();
+
+  // Clear cache on version upgrade
+  const currentVersion = app.getVersion();
+  const versionFilePath = path.join(app.getPath('userData'), 'last-version.txt');
+  try {
+    const lastVersion = fs.existsSync(versionFilePath)
+      ? fs.readFileSync(versionFilePath, 'utf-8').trim()
+      : '';
+    if (lastVersion && lastVersion !== currentVersion) {
+      console.log(`Version changed from ${lastVersion} to ${currentVersion}, clearing cache...`);
+      await session.defaultSession.clearCache();
+      await session.defaultSession.clearStorageData({
+        storages: ['cachestorage', 'serviceworkers'],
+      });
+      console.log('Cache cleared successfully');
+    }
+    fs.writeFileSync(versionFilePath, currentVersion, 'utf-8');
+  } catch (err) {
+    console.warn('Failed to check/clear version cache:', err);
+  }
 
   // Set macOS Dock icon
   if (process.platform === 'darwin' && app.dock) {

@@ -9,14 +9,20 @@ import type {
   SDKToolProgressMessage,
   Options,
   McpStdioServerConfig,
+  McpSSEServerConfig,
+  McpHttpServerConfig,
+  McpServerConfig,
   NotificationHookInput,
   PostToolUseHookInput,
 } from '@anthropic-ai/claude-agent-sdk';
-import type { ClaudeStreamOptions, SSEEvent, TokenUsage, MCPServerConfig, PermissionRequestEvent } from '@/types';
+import type { ClaudeStreamOptions, SSEEvent, TokenUsage, MCPServerConfig, PermissionRequestEvent, FileAttachment } from '@/types';
+import { isImageFile } from '@/types';
 import { registerPendingPermission } from './permission-registry';
-import { getSetting } from './db';
-import { findClaudeBinary, getExpandedPath } from './platform';
+import { getSetting, getActiveProvider } from './db';
+import { findClaudeBinary, findGitBash, getExpandedPath } from './platform';
 import os from 'os';
+import fs from 'fs';
+import path from 'path';
 
 let cachedClaudePath: string | null | undefined;
 
@@ -28,18 +34,64 @@ function findClaudePath(): string | undefined {
 }
 
 /**
- * Convert our MCPServerConfig to the SDK's McpStdioServerConfig format
+ * Convert our MCPServerConfig to the SDK's McpServerConfig format.
+ * Supports stdio, sse, and http transport types.
  */
 function toSdkMcpConfig(
   servers: Record<string, MCPServerConfig>
-): Record<string, McpStdioServerConfig> {
-  const result: Record<string, McpStdioServerConfig> = {};
+): Record<string, McpServerConfig> {
+  const result: Record<string, McpServerConfig> = {};
   for (const [name, config] of Object.entries(servers)) {
-    result[name] = {
-      command: config.command,
-      args: config.args,
-      env: config.env,
-    };
+    const transport = config.type || 'stdio';
+
+    switch (transport) {
+      case 'sse': {
+        if (!config.url) {
+          console.warn(`[mcp] SSE server "${name}" is missing url, skipping`);
+          continue;
+        }
+        const sseConfig: McpSSEServerConfig = {
+          type: 'sse',
+          url: config.url,
+        };
+        if (config.headers && Object.keys(config.headers).length > 0) {
+          sseConfig.headers = config.headers;
+        }
+        result[name] = sseConfig;
+        break;
+      }
+
+      case 'http': {
+        if (!config.url) {
+          console.warn(`[mcp] HTTP server "${name}" is missing url, skipping`);
+          continue;
+        }
+        const httpConfig: McpHttpServerConfig = {
+          type: 'http',
+          url: config.url,
+        };
+        if (config.headers && Object.keys(config.headers).length > 0) {
+          httpConfig.headers = config.headers;
+        }
+        result[name] = httpConfig;
+        break;
+      }
+
+      case 'stdio':
+      default: {
+        if (!config.command) {
+          console.warn(`[mcp] stdio server "${name}" is missing command, skipping`);
+          continue;
+        }
+        const stdioConfig: McpStdioServerConfig = {
+          command: config.command,
+          args: config.args,
+          env: config.env,
+        };
+        result[name] = stdioConfig;
+        break;
+      }
+    }
   }
   return result;
 }
@@ -82,6 +134,29 @@ function extractTokenUsage(msg: SDKResultMessage): TokenUsage | null {
  * Stream Claude responses using the Agent SDK.
  * Returns a ReadableStream of SSE-formatted strings.
  */
+/**
+ * Save non-image file attachments to a temporary upload directory
+ * and return the file paths. The files are placed in .codepilot-uploads/
+ * under the working directory so Claude's Read tool can access them.
+ */
+function saveUploadedFiles(files: FileAttachment[], workDir: string): string[] {
+  const uploadDir = path.join(workDir, '.codepilot-uploads');
+  if (!fs.existsSync(uploadDir)) {
+    fs.mkdirSync(uploadDir, { recursive: true });
+  }
+  const savedPaths: string[] = [];
+  for (const file of files) {
+    // Sanitize filename to prevent directory traversal
+    const safeName = path.basename(file.name).replace(/[^a-zA-Z0-9._-]/g, '_');
+    const timestamp = Date.now();
+    const filePath = path.join(uploadDir, `${timestamp}-${safeName}`);
+    const buffer = Buffer.from(file.data, 'base64');
+    fs.writeFileSync(filePath, buffer);
+    savedPaths.push(filePath);
+  }
+  return savedPaths;
+}
+
 export function streamClaude(options: ClaudeStreamOptions): ReadableStream<string> {
   const {
     prompt,
@@ -92,6 +167,7 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
     mcpServers,
     abortController,
     permissionMode,
+    files,
   } = options;
 
   return new ReadableStream<string>({
@@ -108,13 +184,65 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
         // Ensure SDK subprocess has expanded PATH (consistent with Electron mode)
         sdkEnv.PATH = getExpandedPath();
 
-        const appToken = getSetting('anthropic_auth_token');
-        const appBaseUrl = getSetting('anthropic_base_url');
-        if (appToken) {
-          sdkEnv.ANTHROPIC_AUTH_TOKEN = appToken;
+        // On Windows, auto-detect Git Bash if not already configured
+        if (process.platform === 'win32' && !process.env.CLAUDE_CODE_GIT_BASH_PATH) {
+          const gitBashPath = findGitBash();
+          if (gitBashPath) {
+            sdkEnv.CLAUDE_CODE_GIT_BASH_PATH = gitBashPath;
+          }
         }
-        if (appBaseUrl) {
-          sdkEnv.ANTHROPIC_BASE_URL = appBaseUrl;
+
+        // Try to get config from active provider first
+        const activeProvider = getActiveProvider();
+
+        if (activeProvider && activeProvider.api_key) {
+          // Clear all existing ANTHROPIC_* variables to prevent conflicts
+          for (const key of Object.keys(sdkEnv)) {
+            if (key.startsWith('ANTHROPIC_')) {
+              delete sdkEnv[key];
+            }
+          }
+
+          // Inject provider config — set both token variants so extra_env can clear the unwanted one
+          sdkEnv.ANTHROPIC_AUTH_TOKEN = activeProvider.api_key;
+          sdkEnv.ANTHROPIC_API_KEY = activeProvider.api_key;
+          if (activeProvider.base_url) {
+            sdkEnv.ANTHROPIC_BASE_URL = activeProvider.base_url;
+          }
+
+          // Inject extra environment variables
+          // Empty string values mean "delete this variable" (e.g. clear ANTHROPIC_API_KEY for AUTH_TOKEN-only providers)
+          try {
+            const extraEnv = JSON.parse(activeProvider.extra_env || '{}');
+            for (const [key, value] of Object.entries(extraEnv)) {
+              if (typeof value === 'string') {
+                if (value === '') {
+                  delete sdkEnv[key];
+                } else {
+                  sdkEnv[key] = value;
+                }
+              }
+            }
+          } catch {
+            // ignore malformed extra_env
+          }
+        } else {
+          // No active provider — check legacy DB settings first, then fall back to
+          // environment variables already present in process.env (copied into sdkEnv above).
+          // This allows users who set ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL
+          // in their shell environment to use them without configuring a provider in the UI.
+          const appToken = getSetting('anthropic_auth_token');
+          const appBaseUrl = getSetting('anthropic_base_url');
+          if (appToken) {
+            sdkEnv.ANTHROPIC_AUTH_TOKEN = appToken;
+          }
+          if (appBaseUrl) {
+            sdkEnv.ANTHROPIC_BASE_URL = appBaseUrl;
+          }
+          // If neither legacy settings nor env vars provide a key, log a warning
+          if (!appToken && !sdkEnv.ANTHROPIC_API_KEY && !sdkEnv.ANTHROPIC_AUTH_TOKEN) {
+            console.warn('[claude-client] No API key found: no active provider, no legacy settings, and no ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN in environment');
+          }
         }
 
         const queryOptions: Options = {
@@ -238,8 +366,28 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
           }
         };
 
+        // Build the prompt: save all file attachments to disk and reference them in the prompt.
+        // Claude Code's built-in Read tool can read images (converts to base64 internally),
+        // PDFs, and text files — this is more reliable than constructing SDK multimodal messages.
+        let finalPrompt: string = prompt;
+
+        if (files && files.length > 0) {
+          const workDir = workingDirectory || process.cwd();
+          const savedPaths = saveUploadedFiles(files, workDir);
+          const fileReferences = savedPaths
+            .map((p, i) => {
+              const f = files[i];
+              if (isImageFile(f.type)) {
+                return `[User attached image: ${p} (${f.name})]`;
+              }
+              return `[User attached file: ${p} (${f.name})]`;
+            })
+            .join('\n');
+          finalPrompt = `${fileReferences}\n\nPlease read the attached file(s) above using your Read tool, then respond to the user's message:\n\n${prompt}`;
+        }
+
         const conversation = query({
-          prompt,
+          prompt: finalPrompt,
           options: queryOptions,
         });
 
